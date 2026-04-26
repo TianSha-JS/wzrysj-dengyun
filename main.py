@@ -1,5 +1,6 @@
-"""主入口：热键监听 + 三阶段串联"""
+"""主入口：热键监听 + 图像检测驱动回放"""
 
+import os
 import sys
 import time
 import threading
@@ -8,10 +9,9 @@ import pyautogui
 from pynput import keyboard
 
 from config import (
-    PHASE1_CLICKS, PHASE3_CLICKS,
-    PHASE1_LOAD_WAIT, PHASE3_LOAD_WAIT, PHASE2_SETTLE_WAIT,
-    HOTKEY_RECORD, HOTKEY_RUN, HOTKEY_STOP,
-    DEFAULT_RECORDING,
+    HOTKEY_RECORD, HOTKEY_RUN, HOTKEY_STOP, HOTKEY_EXIT,
+    DEFAULT_RECORDING, RUN_COUNT, RUN_INTERVAL,
+    IMG_SEG1, IMG_SEG2, IMG_CONFIDENCE, IMG_CHECK_INTERVAL, IMG_TIMEOUT,
 )
 from recorder import Recorder
 from player import Player
@@ -28,59 +28,86 @@ class Automation:
         self.player = Player()
         self._running = False
 
-    def phase1_enter(self):
-        """Phase 1: 从主界面进入小游戏。"""
-        print("[Phase 1] 进入小游戏...")
-        for x, y, desc in PHASE1_CLICKS:
-            pyautogui.click(x, y)
-            print(f"  点击: {desc} ({x}, {y})")
-            time.sleep(PHASE1_LOAD_WAIT)
-        print("[Phase 1] 完成")
+    def wait_for_image(self, image_path: str, desc: str) -> bool:
+        """等待屏幕上出现指定图片。"""
+        print(f"  等待检测: {desc} ...")
+        start = time.time()
+        while self._running and (time.time() - start) < IMG_TIMEOUT:
+            try:
+                loc = pyautogui.locateOnScreen(image_path, confidence=IMG_CONFIDENCE)
+                if loc is not None:
+                    print(f"  检测到: {desc}")
+                    return True
+            except Exception:
+                pass
+            time.sleep(IMG_CHECK_INTERVAL)
+        print(f"  超时未检测到: {desc}")
+        return False
 
-    def phase3_exit(self):
-        """Phase 3: 退出回到主界面。"""
-        print("[Phase 3] 退出小游戏...")
-        time.sleep(PHASE3_LOAD_WAIT)
-        for x, y, desc in PHASE3_CLICKS:
-            pyautogui.click(x, y)
-            print(f"  点击: {desc} ({x}, {y})")
-            time.sleep(0.5)
-        print("[Phase 3] 完成")
+    def _run_once(self, phases, run_num):
+        """执行一局。"""
+        print(f"\n--- 第 {run_num} 局 ---\n")
+
+        # Phase 1: 回放 UI 点击（进游戏）
+        print("[Phase 1] 进入游戏...")
+        self.player.play_segment(phases["p1"], center_reset=False)
+
+        # 等待加载完成
+        if not self.wait_for_image(IMG_SEG1, "加载完成"):
+            return False
+
+        # Phase 2: 回放跑酷
+        print("[Phase 2] 跑酷...")
+        time.sleep(0.5)
+        self.player.play_segment(phases["p2"], center_reset=True)
+
+        # 等待结算画面
+        if not self.wait_for_image(IMG_SEG2, "结算画面"):
+            return False
+
+        # Phase 3: 回放退出操作
+        print("[Phase 3] 退出...")
+        time.sleep(0.5)
+        self.player.play_segment(phases["p3"], center_reset=False)
+
+        return True
 
     def run_full(self, recording_path: str = None):
-        """执行完整的三阶段自动化。"""
         if recording_path is None:
             recording_path = DEFAULT_RECORDING
 
+        if not os.path.exists(recording_path):
+            print(f"[错误] 找不到录制文件: {recording_path}")
+            print(f"  请先按 F10 录制一局")
+            return
+
         self._running = True
         print(f"\n{'='*50}")
-        print(f"登云拾穗自动化 - 开始运行")
-        print(f"{'='*50}\n")
+        print(f"登云拾穗自动化 - 连续运行 {RUN_COUNT} 局")
+        print(f"{'='*50}")
 
-        # Phase 1
-        if not self._running:
-            return
-        self.phase1_enter()
-
-        # Phase 2: 回放跑酷
-        if not self._running:
-            return
-        print("\n[Phase 2] 开始跑酷回放...")
-        time.sleep(PHASE2_SETTLE_WAIT)
         data = self.player.load(recording_path)
-        self.player.play(data)
+        phases = self.player.split_phases(data)
 
-        # Phase 3
-        if not self._running:
-            return
-        self.phase3_exit()
+        for i in range(1, RUN_COUNT + 1):
+            if not self._running:
+                break
+
+            if not self._run_once(phases, i):
+                break
+
+            # 不是最后一局则等待
+            if i < RUN_COUNT and self._running:
+                print(f"\n等待 {RUN_INTERVAL} 秒后开始下一局...")
+                end = time.time() + RUN_INTERVAL
+                while time.time() < end and self._running:
+                    time.sleep(0.1)
 
         print(f"\n{'='*50}")
-        print(f"登云拾穗自动化 - 运行完成")
+        print(f"登云拾穗自动化 - 全部完成")
         print(f"{'='*50}\n")
 
     def stop(self):
-        """紧急停止。"""
         self._running = False
         self.recorder.recording = False
         self.player.stop()
@@ -89,12 +116,23 @@ class Automation:
 
 def main():
     automation = Automation()
+    ctrl_held = {"ctrl_l": False, "ctrl_r": False}
 
     def on_press(key):
+        nonlocal ctrl_held
         try:
             k = key.name if hasattr(key, 'name') else key.char
         except AttributeError:
             return
+
+        if k in ("ctrl_l", "ctrl_r"):
+            ctrl_held[k] = True
+            return
+
+        if k == HOTKEY_EXIT[1] and (ctrl_held["ctrl_l"] or ctrl_held["ctrl_r"]):
+            print("[退出]")
+            automation.stop()
+            sys.exit(0)
 
         if k == HOTKEY_RECORD:
             if not automation.recorder.recording:
@@ -112,16 +150,28 @@ def main():
         elif k == HOTKEY_STOP:
             automation.stop()
 
+    def on_release(key):
+        nonlocal ctrl_held
+        try:
+            k = key.name if hasattr(key, 'name') else key.char
+        except AttributeError:
+            return
+        if k in ("ctrl_l", "ctrl_r"):
+            ctrl_held[k] = False
+
     print("=" * 50)
     print("登云拾穗自动化脚本")
     print("=" * 50)
-    print(f"  F9  = 开始/停止录制")
-    print(f"  F10 = 开始自动运行")
-    print(f"  F12 = 紧急停止")
+    print(f"  F7       = 录制中标记：跑酷开始")
+    print(f"  F8       = 录制中标记：结算开始")
+    print(f"  F10      = 开始/停止录制")
+    print(f"  F11      = 开始自动运行")
+    print(f"  F12      = 紧急停止")
+    print(f"  Ctrl+F12 = 退出程序")
     print("=" * 50)
     print("等待操作...\n")
 
-    with keyboard.Listener(on_press=on_press) as listener:
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
 
 
